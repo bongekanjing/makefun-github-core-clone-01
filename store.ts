@@ -121,8 +121,15 @@ export const STRANGER: ViewerUser = SCENARIO_USERS[2] as ViewerUser;
 /** Fixed epoch (2025-01-01T00:00:00Z) plus a sequence: deterministic, monotonic. */
 export const EPOCH_SEC = 1_735_689_600;
 
+// tsFor is pure (EPOCH_SEC + seq) and is called for the same handful of
+// seqs on every read, so memoise it instead of allocating a Date per call.
+const tsCache = new Map<number, string>();
 export function tsFor(seq: number): string {
-  return new Date((EPOCH_SEC + seq) * 1000).toISOString();
+  const cached = tsCache.get(seq);
+  if (cached !== undefined) return cached;
+  const value = new Date((EPOCH_SEC + seq) * 1000).toISOString();
+  tsCache.set(seq, value);
+  return value;
 }
 
 /** The identity server-made commits carry (fixed timestamp: byte-deterministic). */

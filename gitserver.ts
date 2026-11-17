@@ -99,10 +99,14 @@ function v0Advertisement(service: 'git-upload-pack' | 'git-receive-pack', repo: 
   return Buffer.concat(parts);
 }
 
-/** v2 capability advertisement body (opens with `version 2`). */
+/** v2 capability advertisement body (opens with `version 2`). Constant: built once. */
+const V2_ADVERTISEMENT: Buffer = Buffer.concat([
+  encodePktLines(['version 2\n', ...UPLOAD_CAPS_V2.map((capability) => `${capability}\n`)]),
+  PKT_FLUSH,
+]);
+
 function v2Advertisement(): Buffer {
-  const lines = ['version 2\n', ...UPLOAD_CAPS_V2.map((capability) => `${capability}\n`)];
-  return Buffer.concat([encodePktLines(lines), PKT_FLUSH]);
+  return V2_ADVERTISEMENT;
 }
 
 export function handleInfoRefs(store: Store, owner: string, repoName: string, service: string, query: URLSearchParams, headers: Record<string, string | undefined>): GitResponse {
@@ -185,8 +189,12 @@ function selectFetchObjects(repo: Repo, request: FetchRequest): FetchSelection {
     }
     const boundary = new Set<string>();
     const visited = new Set<string>();
-    while (queue.length > 0) {
-      const { oid, gen } = queue.shift() as { oid: string; gen: number };
+    // Index-based queue: Array.shift() is O(n) per dequeue (it re-indexes
+    // the whole array), which turns a 200-commit walk quadratic.
+    let head = 0;
+    while (head < queue.length) {
+      const { oid, gen } = queue[head] as { oid: string; gen: number };
+      head += 1;
       if (visited.has(oid)) continue;
       visited.add(oid);
       if (gen >= (request.depth as number)) continue;

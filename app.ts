@@ -247,8 +247,23 @@ export function createApp(store: Store): ReturnType<typeof createServer> {
     void (async () => {
       const requestId = ++requestCounter;
       const method = req.method ?? 'GET';
-      const url = new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
-      let pathname = decodeURIComponent(url.pathname);
+      // Fast path for the request URL: `new URL` costs ~6us per request (it
+      // parses the full URL grammar). Our requests are plain origin-form
+      // paths, so split on '?' by hand and build the search params directly;
+      // fall back to the URL parser for paths that need normalisation.
+      const rawUrl = req.url ?? '/';
+      const qIndex = rawUrl.indexOf('?');
+      const rawPath = qIndex < 0 ? rawUrl : rawUrl.slice(0, qIndex);
+      let pathname: string;
+      let query: URLSearchParams;
+      if (rawPath.includes('..') || rawPath.includes('//')) {
+        const url = new URL(rawUrl, `http://${req.headers.host ?? '127.0.0.1'}`);
+        pathname = decodeURIComponent(url.pathname);
+        query = url.searchParams;
+      } else {
+        pathname = rawPath.includes('%') ? decodeURIComponent(rawPath) : rawPath;
+        query = qIndex < 0 ? new URLSearchParams() : new URLSearchParams(rawUrl.slice(qIndex + 1));
+      }
       if (pathname.length > 1 && pathname.endsWith('/')) pathname = pathname.slice(0, -1);
       const ctx: Ctx = {
         store,
@@ -258,7 +273,7 @@ export function createApp(store: Store): ReturnType<typeof createServer> {
         requestId,
         method,
         pathname,
-        query: url.searchParams,
+        query,
         host: req.headers.host ?? '127.0.0.1',
       };
 

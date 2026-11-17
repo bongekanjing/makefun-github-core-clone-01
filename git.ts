@@ -356,8 +356,43 @@ export function applyDelta(base: Buffer, delta: Buffer): Buffer {
 
 // ---------------------------------------------------------------- packs
 
+// Adler-32, as used by the zlib trailer. Chunked so the running sums stay
+// small; the modulus is applied every 5552 bytes (the standard NMAX bound).
+function adler32(data: Buffer): number {
+  const MOD = 65521;
+  let a = 1;
+  let b = 0;
+  let i = 0;
+  while (i < data.length) {
+    const end = Math.min(i + 5552, data.length);
+    for (; i < end; i += 1) {
+      a += data[i] as number;
+      b += a;
+    }
+    a %= MOD;
+    b %= MOD;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
 function inflateAt(buffer: Buffer, offset: number): { data: Buffer; next: number } {
-  // inflateSync ignores trailing bytes, so binary-search the shortest slice that inflates.
+  // Fast path: inflateSync stops at the end of the first zlib stream and
+  // ignores trailing bytes, so ONE inflate yields the object. The stream's
+  // last four bytes are the Adler-32 of the decompressed data, so the stream
+  // ends four bytes past the first occurrence of that checksum. (A chance
+  // occurrence inside the deflate data is ~2^-32 per byte position; if it
+  // ever happened, the next object's size check would fail loudly.)
+  // Fall back to the binary search when the checksum is not found.
+  try {
+    const data = inflateSync(buffer.subarray(offset));
+    const adler = adler32(data);
+    const needle = Buffer.from([(adler >>> 24) & 0xff, (adler >>> 16) & 0xff, (adler >>> 8) & 0xff, adler & 0xff]);
+    const idx = buffer.indexOf(needle, offset + 2);
+    if (idx >= 0) return { data, next: idx + 4 };
+  } catch {
+    // Not a complete stream at this offset; fall through to the search.
+  }
+  // Binary-search the shortest slice that inflates.
   let lo = 1;
   let hi = buffer.length - offset;
   let answer = -1;
@@ -443,6 +478,9 @@ export function readPack(pack: Buffer, options: { resolveBase?: ObjectLookup } =
   }
 
   const byOffset = new Map<number, GitObject>();
+  const byOid = new Map<string, GitObject>();
+  const rawByOffset = new Map<number, RawEntry>();
+  for (const entry of raw) rawByOffset.set(entry.offset, entry);
   const objects = new Map<string, GitObject>();
   const resolve = (entry: RawEntry, seen: Set<number>): GitObject => {
     if (entry.kind >= 1 && entry.kind <= 4) {
@@ -453,28 +491,15 @@ export function readPack(pack: Buffer, options: { resolveBase?: ObjectLookup } =
     seen.add(entry.offset);
     let base: GitObject | undefined;
     if (entry.baseOffset !== undefined) {
-      const baseEntry = raw.find((candidate) => candidate.offset === entry.baseOffset);
+      const baseEntry = rawByOffset.get(entry.baseOffset);
       if (baseEntry !== undefined) base = resolve(baseEntry, seen);
       else if (options.resolveBase !== undefined) {
         // An OFS_DELTA whose base is not in this pack cannot be resolved by oid; it is corrupt.
         throw new Error('ofs-delta base is not in the pack');
       }
     } else if (entry.baseOid !== undefined) {
-      const baseEntry = raw.find((candidate) => {
-        // A ref-delta base inside this pack is found by its recomputed oid; try the
-        // already-resolved entries first, then fall back to resolving by oid below.
-        return false && candidate.offset === -1;
-      });
-      void baseEntry;
-      for (const candidate of raw) {
-        if (byOffset.has(candidate.offset)) {
-          const resolved = byOffset.get(candidate.offset) as GitObject;
-          if (hashObject(resolved.type, resolved.data) === entry.baseOid) {
-            base = resolved;
-            break;
-          }
-        }
-      }
+      // A ref-delta base inside this pack is found by its recomputed oid.
+      base = byOid.get(entry.baseOid);
       if (base === undefined && options.resolveBase !== undefined) base = options.resolveBase(entry.baseOid);
       if (base === undefined) {
         // The base may be a later entry in this pack: resolve every entry once, then retry.
@@ -482,8 +507,10 @@ export function readPack(pack: Buffer, options: { resolveBase?: ObjectLookup } =
           if (candidate === entry) continue;
           try {
             const resolved = resolve(candidate, new Set());
+            const candidateOid = hashObject(resolved.type, resolved.data);
             byOffset.set(candidate.offset, resolved);
-            if (hashObject(resolved.type, resolved.data) === entry.baseOid) {
+            byOid.set(candidateOid, resolved);
+            if (candidateOid === entry.baseOid) {
               base = resolved;
               break;
             }
@@ -506,8 +533,10 @@ export function readPack(pack: Buffer, options: { resolveBase?: ObjectLookup } =
       if (!pending.has(entry.offset)) continue;
       try {
         const resolved = resolve(entry, new Set());
+        const oid = hashObject(resolved.type, resolved.data);
         byOffset.set(entry.offset, resolved);
-        objects.set(hashObject(resolved.type, resolved.data), resolved);
+        byOid.set(oid, resolved);
+        objects.set(oid, resolved);
         pending.delete(entry.offset);
         progress = true;
       } catch {
@@ -543,19 +572,19 @@ function writePackObjectHeader(type: GitObjectType, size: number): Buffer {
 
 /** Write a packfile of whole objects (no deltas). Deterministic: entries sorted by oid. */
 export function writePack(objects: Iterable<GitObject>): Buffer {
-  const list = [...objects];
-  list.sort((a, b) => {
-    const ha = hashObject(a.type, a.data);
-    const hb = hashObject(b.type, b.data);
-    return ha < hb ? -1 : ha > hb ? 1 : 0;
-  });
+  // Hash each object exactly once, then sort by the precomputed oid. The
+  // naive version called hashObject on both sides of every comparison, which
+  // re-hashed the same objects O(log n) times each — for a 600-object pack
+  // that is ~7,000 SHA-1s instead of 600.
+  const list = [...objects].map((object) => ({ oid: hashObject(object.type, object.data), object }));
+  list.sort((a, b) => (a.oid < b.oid ? -1 : a.oid > b.oid ? 1 : 0));
   const parts: Buffer[] = [];
   const header = Buffer.alloc(12);
   header.write('PACK', 0, 4, 'ascii');
   header.writeUInt32BE(2, 4);
   header.writeUInt32BE(list.length, 8);
   parts.push(header);
-  for (const object of list) {
+  for (const { object } of list) {
     parts.push(writePackObjectHeader(object.type, object.data.length));
     parts.push(deflateSync(object.data));
   }
